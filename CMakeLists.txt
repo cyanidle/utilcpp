@@ -3,4 +3,4 @@ project(utilcpp LANGUAGES CXX C)
 
 add_library(utilcpp INTERFACE)
 add_library(utilcpp::utilcpp ALIAS utilcpp)
-target_include_directories(utilcpp include)
+target_include_directories(utilcpp INTERFACE include)
