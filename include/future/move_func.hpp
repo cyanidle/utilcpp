@@ -1,13 +1,16 @@
-#ifndef UTILCPP_CALL_ONCE_HPP
-#define UTILCPP_CALL_ONCE_HPP
+#ifndef FUT_CALL_ONCE_HPP
+#define FUT_CALL_ONCE_HPP
 
 #include <cassert>
 #include <stdexcept>
 #include <utility>
 #include <cstddef>
-#include "meta.hpp"
+#include <type_traits>
+#include "meta/meta.hpp"
 
-namespace util {
+namespace fut {
+
+using namespace meta;
 
 static constexpr auto DEFAULT_SOO = sizeof(void*) * 3;
 
@@ -35,7 +38,7 @@ protected:
 
 template<typename Fn, size_t SOO, typename Ret, typename...Args>
 struct ManagerImpl final : Manager<SOO, Ret, Args...> {
-    util_AlwaysInline static Fn& get(Storage<SOO>* stor) noexcept {
+    meta_alwaysInline static Fn& get(Storage<SOO>* stor) noexcept {
         if constexpr (sizeof(Fn) > SOO)
             return *static_cast<Fn*>(stor->_big);
         else
@@ -64,7 +67,7 @@ struct ManagerImpl final : Manager<SOO, Ret, Args...> {
 template<typename Ret, typename...Args>
 struct FuncSig {
     using R = Ret;
-    using A = TypeList<Args...>;
+    using A = meta::TypeList<Args...>;
 };
 
 template<typename Sig, size_t SOO = DEFAULT_SOO> class MoveFunc;
@@ -94,7 +97,7 @@ public:
     explicit operator bool() const noexcept {
         return manager;
     }
-    util_AlwaysInline Ret operator()(Args...a) {
+    meta_alwaysInline Ret operator()(Args...a) {
         if (!manager) {
             throw InvalidMoveFuncCall();
         }
@@ -132,6 +135,6 @@ private:
 template<typename Ret, typename...Args>
 MoveFunc(Ret(*)(Args...)) -> MoveFunc<Ret(Args...)>;
 
-} //util
+} //fut
 
-#endif // UTILCPP_CALL_ONCE_HPP
+#endif // FUT_CALL_ONCE_HPP

@@ -1,11 +1,9 @@
-#ifndef UTILCPP_PROMISE_HPP
-#define UTILCPP_PROMISE_HPP
+#ifndef FUT_PROMISE_HPP
+#define FUT_PROMISE_HPP
 
 #include <cassert>
 #include <atomic>
 #include "move_func.hpp"
-#include "meta.hpp"
-#include "defer.hpp"
 
 #define MV(x) x=std::move(x)
 
@@ -14,8 +12,14 @@ template<typename T> class future;
 template<typename T> class promise;
 }
 
-namespace util
+namespace fut
 {
+
+struct TimeoutError : public std::exception {
+    const char* what() const noexcept override {
+        return "Timeout Error";
+    }
+};
 
 template<typename T> struct Promise;
 template<typename T> struct is_promise : std::false_type {};
@@ -26,6 +30,10 @@ template<typename T> struct is_future<Future<T>> : std::true_type {};
 template<typename T> struct FutureStateData;
 template<typename T> struct FutureState;
 template<typename T> struct FutureResult;
+
+struct PromiseDeath : public std::exception {
+    const char* what() const noexcept override;
+};
 
 template<typename T> struct FutureResult
 {
@@ -41,6 +49,9 @@ template<typename T> struct FutureResult
     }
     std::exception_ptr Exception() const noexcept {
         return exc;
+    }
+    std::exception_ptr MoveException() noexcept {
+        return std::move(exc);
     }
     FutureResult(T* res) noexcept {
         this->res = res;
@@ -182,13 +193,13 @@ struct PromiseBase {
         return state && !state.data->IsResolved();
     }
     ~PromiseBase() {
-        if (util_Unlikely(IsValid() && state.data->IsFutureTaken())) {
+        if (meta_Unlikely(IsValid() && state.data->IsFutureTaken())) {
             Resolve(TimeoutError{});
         }
     }
 protected:
     void checkValid() const {
-        if (util_Unlikely(!state)) {
+        if (meta_Unlikely(!state)) {
             throw std::runtime_error("invalid Promise<T> accessed");
         }
     }
@@ -460,15 +471,15 @@ auto Future<T>::Then(Cb cb) noexcept {
         };
         return fut;
     } else {
-        static_assert(always_false_v<Cb>, "Invalid callback => must accept Result<T> or T");
+        static_assert(always_false<Cb>, "Invalid callback => must accept Result<T> or T");
     }
 }
 
 template<>
 struct Promise<void> : PromiseBase<void> {
-    using PromiseBase<void>::Resolve;
-    using PromiseBase<void>::PromiseBase;
-    using PromiseBase<void>::operator=;
+    using PromiseBase::Resolve;
+    using PromiseBase::PromiseBase;
+    using PromiseBase::operator=;
     void Resolve() const noexcept {
         auto res = reinterpret_cast<void*>(1);
         this->checkValid();
@@ -494,9 +505,12 @@ struct Promise<void> : PromiseBase<void> {
     }
 };
 
+inline const char *PromiseDeath::what() const noexcept {
+    return "rpcxx::Promise<T> died before being resolved";
+}
 
 inline void FutureStateBase::StartGetFuture() {
-    if (util_Unlikely(Flags & future_taken)) {
+    if (meta_Unlikely(Flags & future_taken)) {
         assert(false && "future taken");
         throw std::runtime_error("GetFuture() already called");
     }
@@ -504,7 +518,7 @@ inline void FutureStateBase::StartGetFuture() {
 }
 
 inline void FutureStateBase::StartExcept() {
-    if (util_Unlikely(IsResolved())) {
+    if (meta_Unlikely(IsResolved())) {
         assert(false && "double resolve");
         throw std::runtime_error("Promise already resolved (Attempt to resolve Error)");
     }
@@ -512,13 +526,13 @@ inline void FutureStateBase::StartExcept() {
 }
 
 inline void FutureStateBase::StartResolve() {
-    if (util_Unlikely(IsResolved())) {
+    if (meta_Unlikely(IsResolved())) {
         assert(false && "double resolve");
         throw std::runtime_error("Promise already resolved (Attempt to resolve Result)");
     }
     Flags |= result_valid;
 }
 
-} //util
+} //fut
 
-#endif // UTILCPP_PROMISE_HPP
+#endif // FUT_PROMISE_HPP

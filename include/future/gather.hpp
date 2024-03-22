@@ -1,10 +1,11 @@
-#ifndef UTILCPP_GATHER_HPP
-#define UTILCPP_GATHER_HPP
+#ifndef FUT_GATHER_HPP
+#define FUT_GATHER_HPP
 
 #include "future.hpp"
+#include <vector>
 #include <memory>
 
-namespace util
+namespace fut
 {
 
 template<typename T>
@@ -83,7 +84,7 @@ auto Gather(std::vector<Future<T>> futs)
     };
     auto ctx = std::make_shared<Ctx>();
     ctx->left = futs.size();
-    auto fin = ctx->prom.GetFuture();
+    auto final = ctx->prom.GetFuture();
     for (auto& f: futs) {
         f.Then([ctx](auto res){
             if (!ctx->prom.IsValid())
@@ -102,10 +103,9 @@ auto Gather(std::vector<Future<T>> futs)
             }
         });
     }
-    return fin;
+    return final;
 }
 
+} //fut
 
-} //util
-
-#endif //UTILCPP_GATHER_HPP
+#endif //FUT_GATHER_HPP
