@@ -31,10 +31,6 @@ template<typename T> struct FutureStateData;
 template<typename T> struct FutureState;
 template<typename T> struct FutureResult;
 
-struct PromiseDeath : public std::exception {
-    const char* what() const noexcept override;
-};
-
 template<typename T> struct FutureResult
 {
     explicit operator bool() const noexcept {
@@ -504,10 +500,6 @@ struct Promise<void> : PromiseBase<void> {
         Resolve(std::forward<U>(val));
     }
 };
-
-inline const char *PromiseDeath::what() const noexcept {
-    return "rpcxx::Promise<T> died before being resolved";
-}
 
 inline void FutureStateBase::StartGetFuture() {
     if (meta_Unlikely(Flags & future_taken)) {
