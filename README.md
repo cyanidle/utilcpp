@@ -1,2 +1,2 @@
 # utilcpp
-A collection of three small libs, include metaprogramming, buffer interfaces and callback-based std::future analog
+A collection of small libs, including metaprogramming, buffer interfaces and callback-based std::future analog
