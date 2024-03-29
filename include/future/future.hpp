@@ -31,6 +31,15 @@ template<typename T> struct FutureStateData;
 template<typename T> struct FutureState;
 template<typename T> struct FutureResult;
 
+namespace det {
+template<typename U>
+using if_exception = std::enable_if_t<std::is_base_of_v<std::exception, std::decay_t<U>>, int>;
+template<typename U> struct _is_small :
+                   std::bool_constant<sizeof(U) <= sizeof(U*) && std::is_trivial_v<U>> {};
+template<> struct _is_small<void> : std::true_type {};
+inline constexpr std::true_type defGuard() noexcept {return {};}
+}
+
 template<typename T> struct FutureResult
 {
     explicit operator bool() const noexcept {
@@ -38,6 +47,13 @@ template<typename T> struct FutureResult
     }
     T* Result() const noexcept {
         return res;
+    }
+    auto MoveResult() noexcept {
+        if (!res) {
+            assert(!"invalid result moved");
+            std::abort();
+        }
+        return std::move(*res);
     }
     [[noreturn]] void Rethrow() {
         assert(exc && "Always check for error before Rethrow()");
@@ -49,25 +65,83 @@ template<typename T> struct FutureResult
     std::exception_ptr MoveException() noexcept {
         return std::move(exc);
     }
-    FutureResult(T* res) noexcept {
-        this->res = res;
-    }
-    FutureResult(std::exception_ptr exc) noexcept :
-        exc(std::move(exc)) {}
+    FutureResult(T* result) noexcept : res(result) {}
+    FutureResult(std::exception_ptr exc) noexcept : exc(std::move(exc)) {}
     FutureResult(FutureResult&&) noexcept = default;
     FutureResult(const FutureResult&) noexcept = default;
 private:
-    mutable std::exception* unpacked = {};
     std::exception_ptr exc = {};
     T* res = {};
+};
+
+template<typename T> struct FutureStateData {
+    static constexpr bool is_small = det::_is_small<T>::value;
+    FutureStateData() noexcept {}
+    FutureStateData(const FutureStateData&) = delete;
+    enum StateFlags {
+        resolved = 1,
+        future_taken = 2
+    };
+    MoveFunc<bool()> Guard = {det::defGuard};
+    void SetCallback(MoveFunc<void(FutureResult<T>)> cb) noexcept {
+        if (Flags & resolved) {
+            if (!Guard()) return;
+            if (error) cb({std::move(error)});
+            else if constexpr (is_small) cb({reinterpret_cast<T*>(&result)});
+            else cb({result});
+        } else {
+            callback = std::move(cb);
+        }
+    }
+    void AddOnce(StateFlags flag) {
+        if (Flags & flag) {
+            assert(!bool("invalid promise (double resolve or GetFuture())"));
+            std::abort();
+        }
+        Flags |= flag;
+    }
+    void Resolve(FutureResult<T> res) noexcept {
+        AddOnce(resolved);
+        Flags |= resolved;
+        if (callback) {
+            if (Guard()) callback(std::move(res));
+        } else if (auto r = res.Result()) {
+            if constexpr (std::is_void_v<T>)
+                result = r;
+            else if constexpr (is_small)
+                new (&result) T{std::move(*r)};
+            else
+                result = new T{std::move(*r)};
+        } else {
+            error = res.MoveException();
+        }
+    }
+    void Unref() noexcept {
+        if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete this;
+        }
+    }
+    void AddRef() noexcept {
+        refs.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~FutureStateData() {
+        if constexpr(!is_small) {
+            if (result) {delete result;}
+        }
+    }
+    std::underlying_type_t<StateFlags> Flags = {};
+protected:
+    std::exception_ptr error = {};
+    std::atomic<int> refs = 0;
+    MoveFunc<void(FutureResult<T>)> callback {};
+    T* result = {}; //maybe an erased small value => use Get/SetResult()
 };
 
 template<typename T>
 struct FutureState {
     FutureStateData<T>* data;
     FutureState(FutureStateData<T>* st = nullptr) : data(st) {
-        if(data)
-            data->AddRef();
+        if(data) data->AddRef();
     }
     operator bool() const noexcept {
         return bool(data);
@@ -75,8 +149,7 @@ struct FutureState {
     FutureStateData<T>* operator->() const noexcept {
         return data;
     }
-    FutureState(const FutureState& o) noexcept {
-        data = o.data;
+    FutureState(const FutureState& o) noexcept : data(o.data) {
         if(data) data->AddRef();
     }
     FutureState(FutureState&& o) noexcept :
@@ -103,7 +176,7 @@ template<typename T>
 struct [[nodiscard]] Future
 {
 public:
-    using type = T;
+    using value_type = T;
     Future() = default;
     Future(Future const&) = delete;
     Future(Future&& o) noexcept : state(std::exchange(o.state, nullptr)) {}
@@ -121,14 +194,13 @@ public:
         return this->Then(std::move(cb));
     }
     template<typename Cb>
-    void Catch(Cb callback) noexcept {
-        this->Then([MV(callback)](FutureResult<T> res){
-            if (!res) {
-                if constexpr(std::is_invocable_v<Cb, std::exception&>) {
-                    try {res.Rethrow();} catch(std::exception& e) {callback(e);}
-                } else {
-                    callback(res.Exception());
-                }
+    void Catch(Cb cb) noexcept {
+        Then([MV(cb)](FutureResult<T> res) noexcept {
+            if (res) return;
+            if constexpr(std::is_invocable_v<Cb, std::exception&>) {
+                try {res.Rethrow();} catch(std::exception& e) {cb(e);}
+            } else {
+                cb(res.MoveException());
             }
         });
     }
@@ -141,30 +213,42 @@ public:
     Future(FutureState<T> state) noexcept : state(state) {}
 protected:
     void checkState() {
-        assert(state && "invalid future resolved");
+        if (meta_Unlikely(!state)) {
+            assert("invalid future resolved");
+            throw std::runtime_error("invalid future resolved");
+        }
     }
     FutureState<T> state = {};
 };
 
+template<typename Der, typename T> struct PromiseBase {
+    void Resolve(T value) const noexcept {
+        static_cast<const Der&>(*this).Resolve({&value});
+    }
+};
+
+template<typename Der> struct PromiseBase<Der, void> {
+    void Resolve() const noexcept {
+        static_cast<const Der&>(*this).Resolve({reinterpret_cast<void*>(1)});
+    }
+};
+
 template<typename T>
-struct PromiseBase {
-    template<typename U>
-    using if_exception = std::enable_if_t<std::is_base_of_v<std::exception, std::decay_t<U>>, int>;
-    using type = T;
-    using State = FutureState<T>;
-    using Result = FutureResult<T>;
-    PromiseBase() : PromiseBase(State{new FutureStateData<T>}) {}
-    PromiseBase(State state_) noexcept : state(std::move(state_)) {}
-    PromiseBase(PromiseBase &&o) noexcept :
+struct Promise : PromiseBase<Promise<T>, T> {
+    using value_type = T;
+    using PromiseBase<Promise<T>, T>::Resolve;
+    Promise() : Promise(FutureState<T>{new FutureStateData<T>}) {}
+    Promise(FutureState<T> state_) noexcept : state(std::move(state_)) {}
+    Promise(Promise &&o) noexcept :
         state{std::exchange(o.state, nullptr)}
     {}
-    PromiseBase& operator=(PromiseBase &&o) noexcept {
+    Promise& operator=(Promise &&o) noexcept {
         std::swap(this->state, o.state);
         return *this;
     }
     Future<T> GetFuture() {
         checkValid();
-        state->StartGetFuture();
+        state->AddOnce(FutureStateData<T>::future_taken);
         return Future<T>(state);
     }
     FutureState<T> TakeState() {
@@ -175,146 +259,37 @@ struct PromiseBase {
     }
     void Resolve(std::exception_ptr exc) const noexcept {
         checkValid();
-        state->StartExcept();
-        if (state->Callback)
-            state->DoCallback(Result{std::move(exc)});
-        else
-            state->SetError(std::move(exc));
+        state->Resolve({std::move(exc)});
     }
-    template<typename U, if_exception<U> = 1>
+    void Resolve(FutureResult<T> res) const noexcept {
+        checkValid();
+        state->Resolve(std::move(res));
+    }
+    template<typename U, det::if_exception<U> = 1>
     void Resolve(U&& exc) const noexcept {
         Resolve(std::make_exception_ptr(std::forward<U>(exc)));
     }
     bool IsValid() const noexcept {
-        return state && !state.data->IsResolved();
+        return state && !(state->Flags & FutureStateData<T>::resolved);
     }
-    ~PromiseBase() {
-        if (meta_Unlikely(IsValid() && state.data->IsFutureTaken())) {
+    template<typename U>
+    void operator()(U&& v) const noexcept {
+        this->Resolve(std::forward<U>(v));
+    }
+    ~Promise() {
+        auto hasFut = IsValid() && (state->Flags & FutureStateData<T>::future_taken);
+        if (meta_Unlikely(hasFut)) {
             Resolve(TimeoutError{});
         }
     }
 protected:
     void checkValid() const {
         if (meta_Unlikely(!state)) {
-            throw std::runtime_error("invalid Promise<T> accessed");
+            assert(false && "invalid promise");
+            std::abort();
         }
     }
-    State state;
-};
-
-template<typename T>
-struct Promise : PromiseBase<T>
-{
-    using PromiseBase<T>::Resolve;
-    using PromiseBase<T>::PromiseBase;
-    using State = FutureState<T>;
-    using Result = FutureResult<T>;
-    void Resolve(T value) const noexcept {
-        this->checkValid();
-        this->state->StartResolve();
-        if (this->state->Callback)
-            this->state->DoCallback(Result{&value});
-        else
-            this->state->SetResult(&value);
-    }
-    void Resolve(Result res) const noexcept {
-        if (auto r = res.Result()) {
-            Resolve(std::move(*r));
-        } else {
-            Resolve(res.Exception());
-        }
-    }
-    template<typename U>
-    void operator()(U&& val) const noexcept {
-        Resolve(std::forward<U>(val));
-    }
-};
-
-struct FutureStateBase {
-    FutureStateBase() noexcept = default;
-    FutureStateBase(const FutureStateBase&) = delete;
-    FutureStateBase(FutureStateBase&&) = delete;
-    enum Flags {
-        result_valid = 1,
-        future_taken = 2,
-        err_set = 4,
-    };
-    bool IsResolved() const noexcept {
-        return Flags & (err_set | result_valid);
-    }
-    bool IsFutureTaken() const noexcept {
-        return Flags & future_taken;
-    }
-    void StartGetFuture();
-    void StartExcept();
-    void StartResolve();
-
-    bool IsError() const noexcept {
-        return Flags & err_set;
-    }
-    void SetError(std::exception_ptr exc) noexcept {
-        std::swap(error, exc);
-    }
-    std::exception_ptr GetError() noexcept {
-        std::exception_ptr temp;
-        std::swap(temp, error);
-        return temp;
-    }
-    void AddRef() noexcept {
-        refs.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    int Flags = 0;
-protected:
-    std::exception_ptr error = {};
-    std::atomic<int> refs = 0;
-};
-
-namespace det {
-template<typename U> struct _is_small :
-                   std::bool_constant<sizeof(U) <= sizeof(U*) && std::is_trivial_v<U>> {};
-template<> struct _is_small<void> : std::true_type {};
-inline constexpr std::true_type defGuard() noexcept {
-    return {};
-}
-}
-
-template<typename T>
-struct FutureStateData : FutureStateBase {
-    static constexpr bool is_small = det::_is_small<T>::value;
-    FutureStateData() noexcept {}
-    MoveFunc<bool()> Guard = {det::defGuard};
-    MoveFunc<void(FutureResult<T>)> Callback {};
-    void DoCallback(FutureResult<T> res) {
-        if (Guard())
-            Callback(std::move(res));
-    }
-    T* GetResult() noexcept {
-        if constexpr (!is_small) return result;
-        else return (Flags & result_valid) ? reinterpret_cast<T*>(&result) : nullptr;
-    }
-    void SetResult(T* res) {
-        if constexpr (std::is_void_v<T>) {
-            result = res;
-        } else if constexpr (is_small) {
-            new (&result) T{std::move(*res)};
-        } else {
-            result = new T{std::move(*res)};
-        }
-    }
-    void Unref() noexcept {
-        if (refs.fetch_sub(1, std::memory_order_release) == 1) {
-            std::atomic_thread_fence(std::memory_order_acquire);
-            delete this;
-        }
-    }
-    ~FutureStateData() {
-        if constexpr(!is_small && !std::is_void_v<T>)
-            if (result)
-                delete result;
-    }
-protected:
-    T* result = {}; //maybe an erased small value => use Get/SetResult()
+    FutureState<T> state;
 };
 
 // callback for any number of args, which does nothing
@@ -327,12 +302,11 @@ std::future<T> ToStdFuture(Future<T>&& fut) {
     auto prom = std::promise<T>();
     auto f = prom.get_future();
     fut.Then([p=std::move(prom)](FutureResult<T> res) mutable {
-        if (auto ok = res.Result()) {
+        if ([[maybe_unused]] auto ok = res.Result()) {
             if constexpr(std::is_void_v<T>) p.set_value();
             else p.set_value(std::move(*ok));
-            (void)ok;
         } else {
-            p.set_exception(std::move(res.Exception()));
+            p.set_exception(res.MoveException());
         }
     });
     return f;
@@ -341,29 +315,26 @@ std::future<T> ToStdFuture(Future<T>&& fut) {
 template<typename T>
 Future<T> FutureFromResult(T value) {
     auto state = new FutureStateData<T>();
-    state->StartResolve();
-    state->SetResult(&value);
+    state->Resolve(&value);
     return Future<T>(state);
 }
 
 inline Future<void> FutureFromVoid() {
     auto state = new FutureStateData<void>();
-    state->StartResolve();
-    state->SetResult(reinterpret_cast<void*>(1));
+    state->Resolve(reinterpret_cast<void*>(1));
     return Future<void>(state);
 }
 
 template<typename T>
 Future<T> FutureFromException(std::exception_ptr exc) {
     auto state = new FutureStateData<T>();
-    state->StartExcept();
-    state->SetError(std::move(exc));
+    state->Resolve(std::move(exc));
     return Future<T>(state);
 }
 
-template<typename T, typename Exc, typename...A>
-Future<T> FutureFromException(A...a) {
-    return FutureFromException<T>(std::make_exception_ptr(Exc(std::move(a)...)));
+template<typename T, typename Exc>
+Future<T> FutureFromException(Exc&& exc) {
+    return FutureFromException<T>(std::make_exception_ptr(std::forward<Exc>(exc)));
 }
 
 namespace det {
@@ -375,42 +346,17 @@ template<typename T>
 template<typename Cb>
 auto Future<T>::Then(Cb cb) noexcept {
     checkState();
-    defer finalize([this]{
-        if (auto r = state.data->GetResult()) {
-            state.data->DoCallback(FutureResult<T>{r});
-        } else if (auto e = state.data->GetError()) {
-            state.data->DoCallback(FutureResult<T>{std::move(e)});
-        }
-        state = {};
-    });
-    if constexpr (is_promise<Cb>::value) {
-        using cb_type = typename Cb::type;
-        using foreign_result = FutureResult<cb_type>;
-        if constexpr (std::is_same_v<cb_type, T>) {
-            this->state.data->Callback = std::move(cb);
-        } else {
-            auto pass = cb.TakeState();
-            this->state.data->Callback =
-                [MV(pass)](FutureResult<T> res) mutable noexcept
-            {
-                if (res) {
-                    cb_type passed = std::move(*res.Result());
-                    pass(foreign_result{&passed});
-                } else {
-                    pass(foreign_result{std::move(res.Exception())});
-                }
-            };
-        }
-    } else if constexpr (std::is_invocable_v<Cb, FutureResult<T>>) {
+    // todo: maybe more optimal forward for promises
+    if constexpr (std::is_invocable_v<Cb, FutureResult<T>>) {
         using rawResT = std::invoke_result_t<Cb, FutureResult<T>>;
         using resT = typename det::strip_fut<rawResT>::type;
         if constexpr (std::is_void_v<rawResT>) {
-            this->state.data->Callback = std::move(cb);
+            this->state->SetCallback(std::move(cb));
+            state = {};
         } else {
             Promise<resT> chain;
             auto fut = chain.GetFuture();
-            this->state.data->Callback =
-                [MV(cb), MV(chain)](FutureResult<T> res) mutable noexcept
+            this->state->SetCallback([MV(cb), MV(chain)](FutureResult<T> res) mutable noexcept
             {
                 try {
                     if constexpr (is_future<rawResT>::value) {
@@ -419,7 +365,8 @@ auto Future<T>::Then(Cb cb) noexcept {
                         chain.Resolve(cb(std::move(res)));
                     }
                 } catch (...) {chain.Resolve(std::current_exception());}
-            };
+            });
+            state = {};
             return fut;
         }
     } else if constexpr (!std::is_void_v<T> && std::is_invocable_v<Cb, T>) {
@@ -427,11 +374,10 @@ auto Future<T>::Then(Cb cb) noexcept {
         using resT = typename det::strip_fut<rawResT>::type;
         Promise<resT> chain;
         auto fut = chain.GetFuture();
-        this->state.data->Callback =
-            [MV(cb), MV(chain)](FutureResult<T> res) mutable noexcept
+        this->state->SetCallback([MV(cb), MV(chain)](FutureResult<T> res) mutable noexcept
         {
             if (!res) {
-                chain.Resolve(res.Exception());
+                chain.Resolve(res.MoveException());
             } else try {
                 auto& pass = *res.Result();
                 if constexpr (std::is_void_v<rawResT>) {
@@ -443,86 +389,33 @@ auto Future<T>::Then(Cb cb) noexcept {
                     chain.Resolve(cb(std::move(pass)));
                 }
             } catch (...) {chain.Resolve(std::current_exception());}
-        };
+        });
+        state = {};
         return fut;
     } else if constexpr (std::is_void_v<T> && std::is_invocable_v<Cb>) {
         using rawResT = std::invoke_result_t<Cb>;
         using resT = typename det::strip_fut<rawResT>::type;
         Promise<resT> chain;
         auto fut = chain.GetFuture();
-        this->state.data->Callback =
-            [MV(cb), MV(chain)](FutureResult<T> res) mutable noexcept
+        this->state->SetCallback([MV(cb), MV(chain)](FutureResult<T> res) mutable noexcept
         {
             if (!res) {
-                chain.Resolve(res.Exception());
+                chain.Resolve(res.MoveException());
             } else try {
-                if constexpr (std::is_void_v<rawResT>) {
-                    cb(); chain.Resolve();
-                } else if constexpr (is_future<rawResT>::value) {
-                    cb().Then(std::move(chain));
-                } else {
-                    chain.Resolve(cb());
-                }
-            } catch (...) {chain.Resolve(std::current_exception());}
-        };
+                    if constexpr (std::is_void_v<rawResT>) {
+                        cb(); chain.Resolve();
+                    } else if constexpr (is_future<rawResT>::value) {
+                        cb().Then(std::move(chain));
+                    } else {
+                        chain.Resolve(cb());
+                    }
+                } catch (...) {chain.Resolve(std::current_exception());}
+        });
+        state = {};
         return fut;
     } else {
         static_assert(always_false<Cb>, "Invalid callback => must accept Result<T> or T");
     }
-}
-
-template<>
-struct Promise<void> : PromiseBase<void> {
-    using PromiseBase::Resolve;
-    using PromiseBase::PromiseBase;
-    using PromiseBase::operator=;
-    void Resolve() const noexcept {
-        auto res = reinterpret_cast<void*>(1);
-        this->checkValid();
-        this->state->StartResolve();
-        if (this->state->Callback)
-            this->state->DoCallback(Result{res});
-        else
-            this->state->SetResult(res);
-    }
-    void operator()() const noexcept {
-        Resolve();
-    }
-    void Resolve(Result res) const noexcept {
-        if (res.Result()) {
-            Resolve();
-        } else {
-            Resolve(res.Exception());
-        }
-    }
-    template<typename U>
-    void operator()(U&& val) const noexcept {
-        Resolve(std::forward<U>(val));
-    }
-};
-
-inline void FutureStateBase::StartGetFuture() {
-    if (meta_Unlikely(Flags & future_taken)) {
-        assert(false && "future taken");
-        throw std::runtime_error("GetFuture() already called");
-    }
-    Flags |= future_taken;
-}
-
-inline void FutureStateBase::StartExcept() {
-    if (meta_Unlikely(IsResolved())) {
-        assert(false && "double resolve");
-        throw std::runtime_error("Promise already resolved (Attempt to resolve Error)");
-    }
-    Flags |= err_set;
-}
-
-inline void FutureStateBase::StartResolve() {
-    if (meta_Unlikely(IsResolved())) {
-        assert(false && "double resolve");
-        throw std::runtime_error("Promise already resolved (Attempt to resolve Result)");
-    }
-    Flags |= result_valid;
 }
 
 } //fut

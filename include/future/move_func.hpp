@@ -31,7 +31,7 @@ template<size_t SOO, typename Ret, typename...Args>
 struct Manager {
     virtual void destroy(Storage<SOO>* stor) noexcept = 0;
     virtual void move(Storage<SOO>* from, Storage<SOO>* to) noexcept = 0;
-    virtual Ret call(Storage<SOO>* stor, Args&&...a) = 0;
+    virtual Ret call(Storage<SOO>* stor, Args...a) = 0;
 protected:
     ~Manager() = default;
 };
@@ -58,7 +58,7 @@ struct ManagerImpl final : Manager<SOO, Ret, Args...> {
             get(from).~Fn();
         }
     }
-    Ret call(Storage<SOO>* stor, Args&&...a) final {
+    Ret call(Storage<SOO>* stor, Args...a) final {
         return get(stor)(std::forward<Args>(a)...);
     }
 };
